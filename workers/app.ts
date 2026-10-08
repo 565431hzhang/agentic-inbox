@@ -111,17 +111,36 @@ app.all("*", (c) => {
 export default {
 	fetch: app.fetch,
 	async email(
-		event: { raw: ReadableStream; rawSize: number },
+		event: {
+			raw: ReadableStream;
+			rawSize: number;
+			forward(rcptTo: string): Promise<void>;
+		},
 		env: Env,
 		ctx: ExecutionContext,
 	) {
+		let processError: unknown;
+
+		// 1. Store the message in agentic-inbox.
 		try {
 			await receiveEmail(event, env, ctx);
 		} catch (e) {
+			processError = e;
 			console.error("Failed to process incoming email:", (e as Error).message, (e as Error).stack);
-			// Re-throw so Cloudflare's email routing can retry delivery or bounce the message.
-			// Swallowing the error would silently drop the email.
-			throw e;
+		}
+
+		// 2. Forward to the personal mailbox regardless of whether storing succeeded.
+		//    The address must be a verified destination in Email Routing.
+		try {
+			await event.forward("你的邮箱@gmail.com");
+		} catch (e) {
+			console.error("Failed to forward email:", (e as Error).message);
+		}
+
+		// 3. Keep the original behavior: re-throw so Cloudflare's email routing can
+		//    retry delivery or bounce the message instead of silently dropping it.
+		if (processError) {
+			throw processError;
 		}
 	},
 };
