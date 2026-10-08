@@ -132,7 +132,7 @@ export default {
 		// 2. Forward to the personal mailbox regardless of whether storing succeeded.
 		//    The address must be a verified destination in Email Routing.
 		try {
-			await event.forward("你的邮箱@gmail.com");
+			await event.forward("565431h@gmail.com");
 		} catch (e) {
 			console.error("Failed to forward email:", (e as Error).message);
 		}
