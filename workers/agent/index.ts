@@ -32,47 +32,6 @@ import {
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
 
-/**
- * Model used for both the chat panel and auto-draft.
- */
-const MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
-
-/**
- * WORKAROUND: with Qwen3 the streamed chat text arrives with every chunk
- * doubled (e.g. "我是我是通义义千千问问"). While the root cause is unconfirmed
- * (likely in the workers-ai-provider stream parsing), this transform drops a
- * text-delta that is identical to the one immediately before it, once per pair.
- *
- * Set to false after upgrading `workers-ai-provider` / `ai` / `@cloudflare/ai-chat`
- * if the duplication no longer happens. Side effect while enabled: a genuinely
- * repeated token pair may be collapsed.
- */
-const DEDUPE_STREAMED_TEXT = true;
-
-function dedupeDoubledText() {
-	return () => {
-		let prev: string | null = null;
-		let justSkipped = false;
-		return new TransformStream<any, any>({
-			transform(chunk, controller) {
-				if (chunk?.type === "text-delta" && typeof chunk.text === "string") {
-					if (prev !== null && chunk.text === prev && !justSkipped) {
-						justSkipped = true;
-						return; // drop the duplicate
-					}
-					justSkipped = false;
-					prev = chunk.text;
-				} else {
-					// Any non-text chunk (start/end/tool call...) resets the state
-					prev = null;
-					justSkipped = false;
-				}
-				controller.enqueue(chunk);
-			},
-		});
-	};
-}
-
 // AI SDK v6 changed tool() overloads significantly. We define tools as plain
 // objects matching the Tool type to avoid overload resolution issues.
 function defineTool(def: {
@@ -127,17 +86,6 @@ You can ONLY draft emails. You do NOT have the ability to send emails directly.
 
 ## Draft Management
 Use discard_draft to delete drafts that the operator rejects or that are no longer needed.`;
-
-/**
- * Extra rules appended ONLY for the interactive chat panel. The default prompt
- * says "output nothing except the tool call", which is meant for auto-draft on
- * new email and makes the model go silent after tool calls in normal chat.
- */
-const CHAT_MODE_RULES = `## Chat mode (the operator is talking to you in the side panel)
-The rules above about outputting nothing except a tool call, and not summarizing, apply ONLY to auto-triggered drafting of a newly arrived email. When the operator asks you something in this chat, you MUST finish with a text reply in the same language the operator wrote in, based on the tool results.
-- Call each read-only tool (list_emails, get_email, get_thread, search_emails) at most once per question with the same arguments. After you receive a tool result, answer from it instead of calling the tool again.
-- If a tool returns no emails, say that the folder is empty.
-- When listing emails, give a short summary per email (sender, subject, date).`;
 
 /**
  * Fetch the custom system prompt for a mailbox from its R2 settings.
@@ -333,21 +281,11 @@ export class EmailAgent extends AIChatAgent<any> {
 		const systemPrompt = await getSystemPrompt(env, mailboxId);
 
 		const result = streamText({
-			model: workersai(MODEL),
-			system: `${systemPrompt}\n\n${CHAT_MODE_RULES}`,
+			model: workersai("@cf/google/gemma-4-26b-a4b-it"),
+			system: systemPrompt,
 			messages: await convertToModelMessages(this.messages),
 			tools,
 			stopWhen: stepCountIs(5),
-			// On the last allowed step, take the tools away so the model has to
-			// answer in text instead of ending on another tool call (empty reply).
-			prepareStep: (({ stepNumber }: { stepNumber: number }) =>
-				stepNumber >= 4
-					? { toolChoice: "none", activeTools: [] }
-					: undefined) as any,
-			// Workaround for doubled streamed text (see DEDUPE_STREAMED_TEXT above)
-			...(DEDUPE_STREAMED_TEXT
-				? { experimental_transform: dedupeDoubledText() as any }
-				: {}),
 			onFinish,
 		});
 
@@ -525,7 +463,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 
 		try {
 			const result = await generateText({
-				model: workersai(MODEL),
+				model: workersai("@cf/google/gemma-4-26b-a4b-it"),
 				system: systemPrompt,
 				messages: await convertToModelMessages(messages),
 				tools,
