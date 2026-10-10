@@ -32,6 +32,47 @@ import {
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
 
+/**
+ * Model used for both the chat panel and auto-draft.
+ */
+const MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
+
+/**
+ * WORKAROUND: with Qwen3 the streamed chat text arrives with every chunk
+ * doubled (e.g. "我是我是通义义千千问问"). While the root cause is unconfirmed
+ * (likely in the workers-ai-provider stream parsing), this transform drops a
+ * text-delta that is identical to the one immediately before it, once per pair.
+ *
+ * Set to false after upgrading `workers-ai-provider` / `ai` / `@cloudflare/ai-chat`
+ * if the duplication no longer happens. Side effect while enabled: a genuinely
+ * repeated token pair may be collapsed.
+ */
+const DEDUPE_STREAMED_TEXT = true;
+
+function dedupeDoubledText() {
+	return () => {
+		let prev: string | null = null;
+		let justSkipped = false;
+		return new TransformStream<any, any>({
+			transform(chunk, controller) {
+				if (chunk?.type === "text-delta" && typeof chunk.text === "string") {
+					if (prev !== null && chunk.text === prev && !justSkipped) {
+						justSkipped = true;
+						return; // drop the duplicate
+					}
+					justSkipped = false;
+					prev = chunk.text;
+				} else {
+					// Any non-text chunk (start/end/tool call...) resets the state
+					prev = null;
+					justSkipped = false;
+				}
+				controller.enqueue(chunk);
+			},
+		});
+	};
+}
+
 // AI SDK v6 changed tool() overloads significantly. We define tools as plain
 // objects matching the Tool type to avoid overload resolution issues.
 function defineTool(def: {
@@ -281,11 +322,15 @@ export class EmailAgent extends AIChatAgent<any> {
 		const systemPrompt = await getSystemPrompt(env, mailboxId);
 
 		const result = streamText({
-			model: workersai("@cf/qwen/qwen3-30b-a3b-fp8"),
+			model: workersai(MODEL),
 			system: systemPrompt,
 			messages: await convertToModelMessages(this.messages),
 			tools,
 			stopWhen: stepCountIs(5),
+			// Workaround for doubled streamed text (see DEDUPE_STREAMED_TEXT above)
+			...(DEDUPE_STREAMED_TEXT
+				? { experimental_transform: dedupeDoubledText() as any }
+				: {}),
 			onFinish,
 		});
 
@@ -463,7 +508,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 
 		try {
 			const result = await generateText({
-				model: workersai("@cf/qwen/qwen3-30b-a3b-fp8"),
+				model: workersai(MODEL),
 				system: systemPrompt,
 				messages: await convertToModelMessages(messages),
 				tools,
