@@ -51,6 +51,51 @@ const MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
  */
 const SIMULATE_STREAMING = true;
 
+/**
+ * Qwen3 sometimes puts its whole answer in the "reasoning" channel and leaves
+ * the text empty (the UI only shows text, so the bubble looks blank). Appending
+ * "/no_think" (Qwen3's soft switch) turns thinking off, which also saves
+ * neurons because reasoning tokens are billed as output.
+ */
+const DISABLE_THINKING = true;
+const THINKING_SWITCH = DISABLE_THINKING ? "\n\n/no_think" : "";
+
+/**
+ * Safety net for the chat panel: if a (non-streaming) result has no text and no
+ * tool call but does have reasoning, show the last block of the reasoning as the
+ * reply instead of an empty bubble. Heuristic: the answer is normally the block
+ * after the last gap of 2+ blank lines.
+ */
+function promoteReasoningIfNoText() {
+	return {
+		wrapGenerate: async ({ doGenerate }: any) => {
+			const result = await doGenerate();
+			const content: any[] = Array.isArray(result?.content) ? result.content : [];
+			const hasText = content.some(
+				(p) => p?.type === "text" && typeof p.text === "string" && p.text.trim(),
+			);
+			const hasToolCall = content.some((p) => p?.type === "tool-call");
+			if (hasText || hasToolCall) return result;
+
+			const reasoning = content
+				.filter((p) => p?.type === "reasoning")
+				.map((p) => (typeof p.text === "string" ? p.text : ""))
+				.join("");
+			if (!reasoning.trim()) return result;
+
+			const blocks = reasoning
+				.split(/\n{3,}/)
+				.map((b) => b.trim())
+				.filter(Boolean);
+			const answer = blocks.length > 1 ? blocks[blocks.length - 1] : reasoning.trim();
+			return {
+				...result,
+				content: [...content.filter((p) => p?.type !== "text"), { type: "text", text: answer }],
+			};
+		},
+	};
+}
+
 // AI SDK v6 changed tool() overloads significantly. We define tools as plain
 // objects matching the Tool type to avoid overload resolution issues.
 function defineTool(def: {
@@ -316,13 +361,13 @@ export class EmailAgent extends AIChatAgent<any> {
 		const chatModel = SIMULATE_STREAMING
 			? wrapLanguageModel({
 					model: workersai(MODEL),
-					middleware: simulateStreamingMiddleware(),
+					middleware: [simulateStreamingMiddleware(), promoteReasoningIfNoText() as any],
 				})
 			: workersai(MODEL);
 
 		const result = streamText({
 			model: chatModel,
-			system: `${systemPrompt}\n\n${CHAT_MODE_RULES}`,
+			system: `${systemPrompt}\n\n${CHAT_MODE_RULES}${THINKING_SWITCH}`,
 			messages: await convertToModelMessages(this.messages),
 			tools,
 			stopWhen: stepCountIs(5),
@@ -504,7 +549,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 		try {
 			const result = await generateText({
 				model: workersai(MODEL),
-				system: systemPrompt,
+				system: systemPrompt + THINKING_SWITCH,
 				messages: await convertToModelMessages(messages),
 				tools,
 				stopWhen: stepCountIs(5),
