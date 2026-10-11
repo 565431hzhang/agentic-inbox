@@ -9,6 +9,7 @@ import {
 	convertToModelMessages,
 	stepCountIs,
 	wrapLanguageModel,
+	simulateStreamingMiddleware,
 } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
@@ -39,90 +40,16 @@ import type { Env } from "../types";
 const MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
 
 /**
- * WORKAROUND for Qwen3 streaming: every streamed delta arrives twice, both for
- * text ("我是我是通通义义…") and for tool-call arguments
- * ('{"folderfolder":…'), which makes tool calls fail JSON parsing.
+ * WORKAROUND for Qwen3 streaming on Workers AI: in streaming mode every delta
+ * arrives (nearly) twice, both for text and for tool-call arguments, which
+ * garbles the reply and makes tool-call JSON invalid. Non-streaming calls are
+ * not affected, so the chat panel calls the model non-streaming and replays the
+ * finished result as a stream (AI SDK simulateStreamingMiddleware). The side
+ * effect is that a reply appears all at once instead of token by token.
  *
- * This middleware sits directly on the model's stream (before the AI SDK parses
- * tool calls). It drops a text-delta / tool-input-delta that is identical to the
- * one right before it (once per pair), and rebuilds the tool call's input from
- * the de-duplicated deltas.
- *
- * Set to false after upgrading workers-ai-provider / ai if the duplication is
- * gone. Side effect while enabled: a genuinely repeated token pair may collapse.
+ * Set to false after upgrading workers-ai-provider / ai if streaming is fixed.
  */
-const DEDUPE_DOUBLED_STREAM = true;
-
-function dedupeDoubledStream() {
-	return {
-		wrapStream: async ({ doStream }: any) => {
-			const { stream, ...rest } = await doStream();
-
-			const last = new Map<string, string>(); // last kept delta per stream
-			const justSkipped = new Map<string, boolean>();
-			const toolInput = new Map<string, string>(); // tool call id -> rebuilt input
-
-			const isDuplicate = (key: string, delta: string): boolean => {
-				if (last.get(key) === delta && !justSkipped.get(key)) {
-					justSkipped.set(key, true);
-					return true;
-				}
-				justSkipped.set(key, false);
-				last.set(key, delta);
-				return false;
-			};
-
-			const out = stream.pipeThrough(
-				new TransformStream<any, any>({
-					transform(part, controller) {
-						switch (part?.type) {
-							case "text-start":
-								last.delete(`t:${part.id}`);
-								justSkipped.delete(`t:${part.id}`);
-								break;
-
-							case "text-delta":
-								if (typeof part.delta === "string" && isDuplicate(`t:${part.id}`, part.delta)) {
-									return;
-								}
-								break;
-
-							case "tool-input-start":
-								toolInput.set(part.id, "");
-								last.delete(`i:${part.id}`);
-								justSkipped.delete(`i:${part.id}`);
-								break;
-
-							case "tool-input-delta":
-								if (typeof part.delta === "string") {
-									if (isDuplicate(`i:${part.id}`, part.delta)) return;
-									toolInput.set(part.id, (toolInput.get(part.id) ?? "") + part.delta);
-								}
-								break;
-
-							case "tool-call": {
-								const rebuilt = toolInput.get(part.toolCallId);
-								if (rebuilt) {
-									try {
-										JSON.parse(rebuilt);
-										controller.enqueue({ ...part, input: rebuilt });
-										return;
-									} catch {
-										// Rebuilt input isn't valid JSON; keep the original part
-									}
-								}
-								break;
-							}
-						}
-						controller.enqueue(part);
-					},
-				}),
-			);
-
-			return { stream: out, ...rest };
-		},
-	};
-}
+const SIMULATE_STREAMING = true;
 
 // AI SDK v6 changed tool() overloads significantly. We define tools as plain
 // objects matching the Tool type to avoid overload resolution issues.
@@ -384,12 +311,12 @@ export class EmailAgent extends AIChatAgent<any> {
 		const tools = createEmailTools(env, mailboxId);
 		const systemPrompt = await getSystemPrompt(env, mailboxId);
 
-		// Streamed chat: wrap the model so doubled Qwen3 deltas are removed
-		// before the AI SDK parses text and tool calls.
-		const chatModel = DEDUPE_DOUBLED_STREAM
+		// Chat panel: call the model non-streaming and replay the result as a
+		// stream, to avoid Qwen3's doubled streaming deltas.
+		const chatModel = SIMULATE_STREAMING
 			? wrapLanguageModel({
 					model: workersai(MODEL),
-					middleware: dedupeDoubledStream() as any,
+					middleware: simulateStreamingMiddleware(),
 				})
 			: workersai(MODEL);
 
