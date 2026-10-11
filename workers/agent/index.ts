@@ -8,6 +8,7 @@ import {
 	generateText,
 	convertToModelMessages,
 	stepCountIs,
+	wrapLanguageModel,
 } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
@@ -31,6 +32,97 @@ import {
 } from "../lib/tools";
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
+
+/**
+ * Model used for both the chat panel and auto-draft.
+ */
+const MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
+
+/**
+ * WORKAROUND for Qwen3 streaming: every streamed delta arrives twice, both for
+ * text ("我是我是通通义义…") and for tool-call arguments
+ * ('{"folderfolder":…'), which makes tool calls fail JSON parsing.
+ *
+ * This middleware sits directly on the model's stream (before the AI SDK parses
+ * tool calls). It drops a text-delta / tool-input-delta that is identical to the
+ * one right before it (once per pair), and rebuilds the tool call's input from
+ * the de-duplicated deltas.
+ *
+ * Set to false after upgrading workers-ai-provider / ai if the duplication is
+ * gone. Side effect while enabled: a genuinely repeated token pair may collapse.
+ */
+const DEDUPE_DOUBLED_STREAM = true;
+
+function dedupeDoubledStream() {
+	return {
+		wrapStream: async ({ doStream }: any) => {
+			const { stream, ...rest } = await doStream();
+
+			const last = new Map<string, string>(); // last kept delta per stream
+			const justSkipped = new Map<string, boolean>();
+			const toolInput = new Map<string, string>(); // tool call id -> rebuilt input
+
+			const isDuplicate = (key: string, delta: string): boolean => {
+				if (last.get(key) === delta && !justSkipped.get(key)) {
+					justSkipped.set(key, true);
+					return true;
+				}
+				justSkipped.set(key, false);
+				last.set(key, delta);
+				return false;
+			};
+
+			const out = stream.pipeThrough(
+				new TransformStream<any, any>({
+					transform(part, controller) {
+						switch (part?.type) {
+							case "text-start":
+								last.delete(`t:${part.id}`);
+								justSkipped.delete(`t:${part.id}`);
+								break;
+
+							case "text-delta":
+								if (typeof part.delta === "string" && isDuplicate(`t:${part.id}`, part.delta)) {
+									return;
+								}
+								break;
+
+							case "tool-input-start":
+								toolInput.set(part.id, "");
+								last.delete(`i:${part.id}`);
+								justSkipped.delete(`i:${part.id}`);
+								break;
+
+							case "tool-input-delta":
+								if (typeof part.delta === "string") {
+									if (isDuplicate(`i:${part.id}`, part.delta)) return;
+									toolInput.set(part.id, (toolInput.get(part.id) ?? "") + part.delta);
+								}
+								break;
+
+							case "tool-call": {
+								const rebuilt = toolInput.get(part.toolCallId);
+								if (rebuilt) {
+									try {
+										JSON.parse(rebuilt);
+										controller.enqueue({ ...part, input: rebuilt });
+										return;
+									} catch {
+										// Rebuilt input isn't valid JSON; keep the original part
+									}
+								}
+								break;
+							}
+						}
+						controller.enqueue(part);
+					},
+				}),
+			);
+
+			return { stream: out, ...rest };
+		},
+	};
+}
 
 // AI SDK v6 changed tool() overloads significantly. We define tools as plain
 // objects matching the Tool type to avoid overload resolution issues.
@@ -86,6 +178,18 @@ You can ONLY draft emails. You do NOT have the ability to send emails directly.
 
 ## Draft Management
 Use discard_draft to delete drafts that the operator rejects or that are no longer needed.`;
+
+/**
+ * Extra rules appended ONLY for the interactive chat panel. The default prompt
+ * says "output nothing except the tool call", which is meant for auto-draft on
+ * new email and can make the model go silent after tool calls in normal chat.
+ * Delete this constant (and its use in onChatMessage) if you don't want it.
+ */
+const CHAT_MODE_RULES = `## Chat mode (the operator is talking to you in the side panel)
+The rules above about outputting nothing except a tool call, and not summarizing, apply ONLY to auto-triggered drafting of a newly arrived email. When the operator asks you something in this chat, you MUST finish with a text reply in the same language the operator wrote in, based on the tool results.
+- After you receive a tool result, answer from it instead of calling the same tool again with the same arguments.
+- If a tool returns no emails, say that the folder is empty.
+- When listing emails, give a short summary per email (sender, subject, date).`;
 
 /**
  * Fetch the custom system prompt for a mailbox from its R2 settings.
@@ -280,9 +384,18 @@ export class EmailAgent extends AIChatAgent<any> {
 		const tools = createEmailTools(env, mailboxId);
 		const systemPrompt = await getSystemPrompt(env, mailboxId);
 
+		// Streamed chat: wrap the model so doubled Qwen3 deltas are removed
+		// before the AI SDK parses text and tool calls.
+		const chatModel = DEDUPE_DOUBLED_STREAM
+			? wrapLanguageModel({
+					model: workersai(MODEL),
+					middleware: dedupeDoubledStream() as any,
+				})
+			: workersai(MODEL);
+
 		const result = streamText({
-			model: workersai("@cf/zai-org/glm-4.7-flash"),
-			system: systemPrompt,
+			model: chatModel,
+			system: `${systemPrompt}\n\n${CHAT_MODE_RULES}`,
 			messages: await convertToModelMessages(this.messages),
 			tools,
 			stopWhen: stepCountIs(5),
@@ -463,7 +576,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 
 		try {
 			const result = await generateText({
-				model: workersai("@cf/zai-org/glm-4.7-flash"),
+				model: workersai(MODEL),
 				system: systemPrompt,
 				messages: await convertToModelMessages(messages),
 				tools,
